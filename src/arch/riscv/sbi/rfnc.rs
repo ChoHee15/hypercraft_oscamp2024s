@@ -1,4 +1,4 @@
-use sbi_spec::rfnc::{REMOTE_FENCE_I, REMOTE_SFENCE_VMA};
+use sbi_spec::rfnc::{REMOTE_FENCE_I, REMOTE_SFENCE_VMA, REMOTE_SFENCE_VMA_ASID};
 
 use crate::HyperResult;
 
@@ -13,6 +13,13 @@ pub enum RemoteFenceFunction {
         hart_mask_base: u64,
         start_addr: u64,
         size: u64,
+    },
+    RemoteSFenceVMA_ASID {
+        hart_mask: u64,
+        hart_mask_base: u64,
+        start_addr: u64,
+        size: u64,
+        asid: u64,
     },
 }
 
@@ -29,7 +36,15 @@ impl RemoteFenceFunction {
                 start_addr: args[2] as u64,
                 size: args[3] as u64,
             }),
-            _ => panic!("Unsupported yet!"),
+            // ADDED
+            REMOTE_SFENCE_VMA_ASID => Ok(Self::RemoteSFenceVMA_ASID { 
+                hart_mask: args[0] as u64,
+                hart_mask_base: args[1] as u64,
+                start_addr: args[2] as u64,
+                size: args[3] as u64,
+                asid: args[4] as u64,
+            }),
+            _ => panic!("Unsupported yet! {:#x?}", args),
         }
     }
 }

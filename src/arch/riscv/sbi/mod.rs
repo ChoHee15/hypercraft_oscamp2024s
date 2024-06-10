@@ -20,6 +20,12 @@ pub const SBI_ERR_DENIED: isize = -4;
 pub const SBI_ERR_INVALID_ADDRESS: isize = -5;
 pub const SBI_ERR_ALREADY_AVAILABLE: isize = -6;
 
+// ADDED
+mod hsm;
+pub use hsm::HSMFunction;
+mod spi;
+pub use spi::IPIFunction;
+
 /// The values returned from an SBI function call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SbiReturn {
@@ -58,6 +64,10 @@ pub enum SbiMessage {
     RemoteFence(RemoteFenceFunction),
     /// The PMU Extension
     PMU(PmuFunction),
+    /// ADDED HSM
+    HSM(HSMFunction),
+    /// ADDED IPI
+    SPI(IPIFunction),
 }
 
 impl SbiMessage {
@@ -76,6 +86,9 @@ impl SbiMessage {
                 RemoteFenceFunction::from_args(args).map(SbiMessage::RemoteFence)
             }
             sbi_spec::pmu::EID_PMU => PmuFunction::from_regs(args).map(SbiMessage::PMU),
+            // ADDED
+            sbi_spec::hsm::EID_HSM => HSMFunction::from_args(args).map(SbiMessage::HSM),
+            sbi_spec::spi::EID_SPI => IPIFunction::from_args(args).map(SbiMessage::SPI),
             _ => {
                 error!("args: {:?}", args);
                 error!("args[7]: {:#x}", args[7]);

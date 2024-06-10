@@ -3,19 +3,17 @@ use core::panic;
 use super::{
     devices::plic::{PlicState, MAX_CONTEXTS},
     regs::GeneralPurposeRegisters,
-    sbi::PmuFunction,
-    sbi::{BaseFunction, RemoteFenceFunction},
+    sbi::{BaseFunction, IPIFunction, PmuFunction, RemoteFenceFunction},
     traps,
     vcpu::{self, VmCpuRegisters},
     vm_pages::VmPages,
     HyperCallMsg, RiscvCsrTrait, CSR,
 };
 use crate::{
-    arch::sbi::SBI_ERR_NOT_SUPPORTED, vcpus::VM_CPUS_MAX, GprIndex, GuestPageTableTrait,
-    GuestPhysAddr, GuestVirtAddr, HyperCraftHal, HyperError, HyperResult, VCpu, VmCpus, VmExitInfo,
+    arch::sbi::{HSMFunction, SBI_ERR_NOT_SUPPORTED}, vcpus::VM_CPUS_MAX, GprIndex, GuestPageTableTrait, GuestPhysAddr, GuestVirtAddr, HyperCraftHal, HyperError, HyperResult, VCpu, VmCpuStatus, VmCpus, VmExitInfo
 };
 use riscv_decode::Instruction;
-use sbi_rt::{pmu_counter_get_info, pmu_counter_stop};
+use sbi_rt::{pmu_counter_get_info, pmu_counter_stop, SbiRet};
 
 /// A VM that is being run.
 pub struct VM<H: HyperCraftHal, G: GuestPageTableTrait> {
@@ -42,9 +40,37 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
         vcpu.init_page_map(self.gpt.token());
     }
 
+    /// Add cpu to vcpus
+    pub fn add_vcpu(&mut self, vcpu: VCpu<H>) -> HyperResult{
+        self.vcpus.add_vcpu(vcpu)
+    }
+
+    /// Waiting sync
+    pub fn sync_vcpu(&mut self, vcpu_id: usize) {
+        let vcpu = self.vcpus.get_vcpu(vcpu_id).unwrap();
+        loop {
+            let state = vcpu.get_status();
+            match state {
+                VmCpuStatus::Runnable =>{
+                    debug!("VCPU{} ready to run!!!", vcpu_id);
+                    break;
+                }
+                VmCpuStatus::Running => {
+                    panic!("wtf??");
+                }
+                _ => {
+                    core::hint::spin_loop();
+                }
+            }
+        }
+    }
+
     #[allow(unused_variables, deprecated)]
     /// Run the host VM's vCPU with ID `vcpu_id`. Does not return.
     pub fn run(&mut self, vcpu_id: usize) {
+        // ADDED
+        self.sync_vcpu(vcpu_id);
+
         let mut vm_exit_info: VmExitInfo;
         let mut gprs = GeneralPurposeRegisters::default();
         loop {
@@ -53,6 +79,7 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
             {
                 let vcpu = self.vcpus.get_vcpu(vcpu_id).unwrap();
                 vm_exit_info = vcpu.run();
+                vcpu.set_status(VmCpuStatus::Runnable);
                 vcpu.save_gprs(&mut gprs);
             }
 
@@ -88,6 +115,15 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                             }
                             HyperCallMsg::PMU(pmu) => {
                                 self.handle_pmu_function(pmu, &mut gprs).unwrap();
+                            }
+                            // ADDED
+                            HyperCallMsg::HSM(hsm) => {
+                                debug!("vcpu{} HSM calling !", vcpu_id);
+                                self.handle_hsm_function(hsm, &mut gprs).unwrap();
+                            }
+                            HyperCallMsg::SPI(spi) => {
+                                trace!("vcpu{} SPI calling !", vcpu_id);
+                                self.handle_spi_function(spi, &mut gprs).unwrap();
                             }
                             _ => todo!(),
                         }
@@ -130,6 +166,14 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                         .read_and_clear_bits(traps::interrupt::SUPERVISOR_TIMER);
                 }
                 VmExitInfo::ExternalInterruptEmulation => self.handle_irq(),
+                // ADDED
+                VmExitInfo::SoftInterruptEmulation => {
+                    // TODO
+                    // 这块内容河里吗
+                    sbi_rt::legacy::clear_ipi();
+                    CSR.hvip
+                        .read_and_set_bits(traps::interrupt::VIRTUAL_SUPERVISOR_SOFT);
+                }
                 _ => {}
             }
 
@@ -202,6 +246,7 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
         let context_id = 1;
         let claim_and_complete_addr = self.plic.base() + 0x0020_0004 + 0x1000 * context_id;
         let irq = unsafe { core::ptr::read_volatile(claim_and_complete_addr as *const u32) };
+        // TODO ang?
         assert!(irq != 0);
         self.plic.claim_complete[context_id] = irq;
 
@@ -309,6 +354,98 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                     start_addr as usize,
                     size as usize,
                 );
+                gprs.set_reg(GprIndex::A0, sbi_ret.error);
+                gprs.set_reg(GprIndex::A1, sbi_ret.value);
+            }
+            // ADDED
+            RemoteFenceFunction::RemoteSFenceVMA_ASID { 
+                hart_mask, 
+                hart_mask_base, 
+                start_addr, 
+                size, 
+                asid 
+            } => {
+                let sbi_ret = sbi_rt::remote_sfence_vma_asid(
+                    hart_mask as usize,
+                    hart_mask_base as usize,
+                    start_addr as usize,
+                    size as usize,
+                    asid as usize,
+                );
+                gprs.set_reg(GprIndex::A0, sbi_ret.error);
+                gprs.set_reg(GprIndex::A1, sbi_ret.value);
+            }
+        }
+        Ok(())
+    }
+
+    // ADDED
+    fn handle_hsm_function(
+        &mut self,
+        hsm: HSMFunction,
+        gprs: &mut GeneralPurposeRegisters,
+    ) -> HyperResult<()> {
+        debug!("---handling hsm function!");
+        match hsm {
+            HSMFunction::HART_START{
+                hartid,
+                start_addr,
+                opaque,
+            } => {
+                debug!("---guest hsm start:({}, {:#x}, {:#x})", hartid, start_addr, opaque);
+
+
+                
+                let vcpu = self.vcpus.get_vcpu(hartid).unwrap();
+
+                vcpu.set_gpr(GprIndex::A0, hartid);
+                vcpu.set_gpr(GprIndex::A1, opaque);
+                vcpu.set_spec(start_addr);
+
+                vcpu.set_status(VmCpuStatus::Runnable);
+                debug!("---guest hsm start set runnable {}", hartid);
+
+
+                let sbi_ret = SbiRet::success(0);
+                gprs.set_reg(GprIndex::A0, sbi_ret.error);
+                gprs.set_reg(GprIndex::A1, sbi_ret.value);
+                // debug!("---guest hsm start return {}", hartid);
+            }
+            HSMFunction::HART_STOP => {
+                panic!("TODO");
+            }
+            HSMFunction::HART_GET_STATUS { 
+                hartid: _ 
+            } =>{
+                panic!("TODO");
+            }
+            HSMFunction::HART_SUSPEND { 
+                suspend_type: _, 
+                resume_addr: _, 
+                opaque: _ 
+            } => {
+                panic!("unknown HSMFunction");
+            }
+        }
+        Ok(())
+    }
+
+    // ADDED
+    fn handle_spi_function(
+        &mut self,
+        spi: IPIFunction,
+        gprs: &mut GeneralPurposeRegisters,
+    ) -> HyperResult<()> {
+        // debug!("---handling spi function!");
+        match spi {
+            IPIFunction::SEND_IPI{
+                hart_mask,
+                hart_mask_base, 
+            } => {
+                trace!("---guest send ipi:({:#x}, {:#x})", hart_mask, hart_mask_base);
+
+                let sbi_ret = sbi_rt::send_ipi(hart_mask, hart_mask_base);
+
                 gprs.set_reg(GprIndex::A0, sbi_ret.error);
                 gprs.set_reg(GprIndex::A1, sbi_ret.value);
             }

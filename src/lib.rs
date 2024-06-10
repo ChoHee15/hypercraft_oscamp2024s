@@ -47,7 +47,7 @@ pub use arch::{
 
 
 pub use arch::{
-    NestedPageTable, PerCpu, VCpu, VM,
+    NestedPageTable, PerCpu, VCpu, VM, VmCpuStatus
 };
 
 pub use hal::HyperCraftHal;

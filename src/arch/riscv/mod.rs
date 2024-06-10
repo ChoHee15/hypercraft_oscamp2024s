@@ -14,7 +14,9 @@ pub use ept::NestedPageTable;
 pub use regs::GprIndex;
 pub use sbi::SbiMessage as HyperCallMsg;
 pub use smp::PerCpu;
-pub use vcpu::VCpu;
+// ADDED
+// pub use vcpu::VCpu;
+pub use vcpu::{VCpu, VmCpuStatus};
 pub use vm::VM;
 pub use vmexit::VmExitInfo;
 

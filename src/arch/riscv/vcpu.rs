@@ -1,7 +1,11 @@
+use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
+use spin::Mutex;
 use core::arch::global_asm;
+use core::borrow::BorrowMut;
 use core::marker::PhantomData;
 use core::mem::size_of;
+use core::ops::Deref;
 use memoffset::offset_of;
 use tock_registers::LocalRegisterCopy;
 
@@ -202,8 +206,12 @@ extern "C" {
     fn _run_guest(state: *mut VmCpuRegisters);
 }
 
+/// 
+#[derive(Default)]
+#[derive(Clone)]
 pub enum VmCpuStatus {
     /// The vCPU is not powered on.
+    #[default]
     PoweredOff,
     /// The vCPU is available to be run.
     Runnable,
@@ -219,6 +227,10 @@ pub struct VCpu<H: HyperCraftHal> {
     // gpt: G,
     // pub guest: Arc<Guest>,
     marker: PhantomData<H>,
+
+    // ADDED
+    status: VmCpuStatus,
+    // status: Mutex<VmCpuStatus>,
 }
 
 impl<H: HyperCraftHal> VCpu<H> {
@@ -240,7 +252,8 @@ impl<H: HyperCraftHal> VCpu<H> {
         sstatus.set_spp(sstatus::SPP::Supervisor);
         regs.guest_regs.sstatus = sstatus.bits();
 
-        regs.guest_regs.gprs.set_reg(GprIndex::A0, 0);
+        // regs.guest_regs.gprs.set_reg(GprIndex::A0, 0);
+        regs.guest_regs.gprs.set_reg(GprIndex::A0, vcpu_id);
         regs.guest_regs.gprs.set_reg(GprIndex::A1, 0x9000_0000);
 
         // Set entry
@@ -250,6 +263,9 @@ impl<H: HyperCraftHal> VCpu<H> {
             regs,
             // gpt,
             marker: PhantomData,
+            // ADDED
+            status: VmCpuStatus::PoweredOff,
+            // status: Mutex::new(VmCpuStatus::PoweredOff),
         }
     }
 
@@ -293,11 +309,22 @@ impl<H: HyperCraftHal> VCpu<H> {
     /// Runs this vCPU until traps.
     pub fn run(&mut self) -> VmExitInfo {
         let regs = &mut self.regs;
+        // ADDED
+        self.status = VmCpuStatus::Running;
+        // let mut tmp = self.status.lock();
+        // *tmp = VmCpuStatus::Running;
+        // drop(tmp);
+
         unsafe {
             // Safe to run the guest as it only touches memory assigned to it by being owned
             // by its page table
             _run_guest(regs);
         }
+        // ADDED
+        self.status = VmCpuStatus::Runnable;
+        // let mut tmp = self.status.lock();
+        // *tmp = VmCpuStatus::Running;
+        // drop(tmp);
         // Save off the trap information
         regs.trap_csrs.scause = scause::read().bits();
         regs.trap_csrs.stval = stval::read();
@@ -339,6 +366,10 @@ impl<H: HyperCraftHal> VCpu<H> {
                     priv_level: PrivilegeLevel::from_hstatus(regs.guest_regs.hstatus),
                 }
             }
+            // ADDED
+            Trap::Interrupt(Interrupt::SupervisorSoft) => {
+                VmExitInfo::SoftInterruptEmulation
+            }
             _ => {
                 panic!(
                     "Unhandled trap: {:?}, sepc: {:#x}, stval: {:#x}",
@@ -374,6 +405,29 @@ impl<H: HyperCraftHal> VCpu<H> {
     pub fn regs(&mut self) -> &mut VmCpuRegisters {
         &mut self.regs
     }
+
+    /// Set status
+    pub fn set_status(&mut self, status: VmCpuStatus) {
+        self.status = status
+        // let mut tmp = self.status.lock();
+        // *tmp = status;
+        // drop(tmp);
+    }
+
+    /// Get status
+    // pub fn get_status(&self) -> &VmCpuStatus {
+    pub fn get_status(&self) -> VmCpuStatus {
+        self.status.clone()
+        // let tmp = self.status.lock();
+        // let a = (*tmp).clone();
+        // a
+    }
+
+    /// Set vCPU's spec
+    pub fn set_spec(&mut self, spec: usize){
+        self.regs.guest_regs.sepc = spec;
+    }
+
 }
 
 // Private methods implements
