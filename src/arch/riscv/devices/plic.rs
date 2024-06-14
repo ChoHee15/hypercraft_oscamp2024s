@@ -56,6 +56,7 @@ impl PlicState {
             let index = ((offset - 0x200000) & 0xfff) >> 2;
             if index == 0 {
                 // threshold
+                // debug!("PLIC write threshold@{:#x} -> {:#x} to {:#x}", addr, self.thresholds[hart], val);
                 self.thresholds[hart] = val;
                 unsafe {
                     core::ptr::write_volatile(addr as *mut u32, val);
@@ -65,6 +66,7 @@ impl PlicState {
                 unsafe {
                     core::ptr::write_volatile(addr as *mut u32, val);
                 }
+                // debug!("PLIC write claim@{:#x} -> {:#x} to {:#x}", addr, self.claim_complete[hart], val);
                 self.claim_complete[hart] = 0;
                 // Send Interrupt to the hart
                 CSR.hvip

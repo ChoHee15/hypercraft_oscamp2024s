@@ -12,6 +12,7 @@ use super::{
 use crate::{
     arch::sbi::{HSMFunction, SBI_ERR_NOT_SUPPORTED}, vcpus::VM_CPUS_MAX, GprIndex, GuestPageTableTrait, GuestPhysAddr, GuestVirtAddr, HyperCraftHal, HyperError, HyperResult, VCpu, VmCpuStatus, VmCpus, VmExitInfo
 };
+use riscv::addr::BitField;
 use riscv_decode::Instruction;
 use sbi_rt::{pmu_counter_get_info, pmu_counter_stop, SbiRet};
 
@@ -78,7 +79,10 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
             let mut advance_pc = false;
             {
                 let vcpu = self.vcpus.get_vcpu(vcpu_id).unwrap();
+                // ADDED
+                vcpu.set_status(VmCpuStatus::Running);
                 vm_exit_info = vcpu.run();
+                // ADDED
                 vcpu.set_status(VmCpuStatus::Runnable);
                 vcpu.save_gprs(&mut gprs);
             }
@@ -91,10 +95,13 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                                 self.handle_base_function(base, &mut gprs).unwrap();
                             }
                             HyperCallMsg::GetChar => {
+                                error!("VCPU{} get char!!", vcpu_id);
                                 let c = sbi_rt::legacy::console_getchar();
-                                gprs.set_reg(GprIndex::A1, c);
+                                // ang?
+                                gprs.set_reg(GprIndex::A0, c);
                             }
                             HyperCallMsg::PutChar(c) => {
+                                error!("VCPU{} put char!!", vcpu_id);
                                 sbi_rt::legacy::console_putchar(c);
                             }
                             HyperCallMsg::SetTimer(timer) => {
@@ -165,12 +172,20 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                     CSR.sie
                         .read_and_clear_bits(traps::interrupt::SUPERVISOR_TIMER);
                 }
-                VmExitInfo::ExternalInterruptEmulation => self.handle_irq(),
+                VmExitInfo::ExternalInterruptEmulation => self.handle_irq(vcpu_id),
                 // ADDED
                 VmExitInfo::SoftInterruptEmulation => {
                     // TODO
                     // 这块内容河里吗
-                    sbi_rt::legacy::clear_ipi();
+                    // debug!("VCPU{} software emulation", vcpu_id);
+                    let mut sip = riscv::register::sip::read().bits();
+                    // debug!("SIP: {:#x}", sip);
+                    let res = sip.set_bit(1, false);
+                    // debug!("Modified SIP {:#x}", res);
+                    riscv::register::sip::write(*res);
+                    // riscv::register::satp::write(res);
+                    // core::arch::asm!("csrrs {0}, {1}, x0", out(reg) r, const $csr_number);
+                    // sbi_rt::legacy::clear_ipi();
                     CSR.hvip
                         .read_and_set_bits(traps::interrupt::VIRTUAL_SUPERVISOR_SOFT);
                 }
@@ -242,12 +257,38 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
         Ok(len)
     }
 
-    fn handle_irq(&mut self) {
-        let context_id = 1;
+    fn handle_irq(&mut self, vcpu_id: usize) {
+        let context_id = vcpu_id * 2 + 1;
         let claim_and_complete_addr = self.plic.base() + 0x0020_0004 + 0x1000 * context_id;
         let irq = unsafe { core::ptr::read_volatile(claim_and_complete_addr as *const u32) };
         // TODO ang?
-        assert!(irq != 0);
+        // assert!(irq != 0);
+        let reg_mmode_addr = self.plic.base() + 0x0020_0004 + 0x1000 * (vcpu_id * 2);
+        let m_irq = unsafe { core::ptr::read_volatile(reg_mmode_addr as *const u32) };
+        debug!("handle_irq {}:{} in vcpu{}@{:#x}", m_irq, irq, vcpu_id, claim_and_complete_addr);
+        // let irq2 = unsafe { core::ptr::read_volatile(claim_and_complete_addr as *const u32) };
+        // debug!("double run : {}", irq2);
+        
+        // let hart0_m_addr = self.plic.base() + 0x0020_0004 + 0x1000 * (0 * 2);
+        // let hart0_m_irq = unsafe { core::ptr::read_volatile(hart0_m_addr as *const u32) };
+        // let hart0_s_addr = self.plic.base() + 0x0020_0004 + 0x1000 * (0 * 2 + 1);
+        // let hart0_s_irq = unsafe { core::ptr::read_volatile(hart0_s_addr as *const u32) };
+
+        // let hart1_m_addr = self.plic.base() + 0x0020_0004 + 0x1000 * (1 * 2);
+        // let hart1_m_irq = unsafe { core::ptr::read_volatile(hart1_m_addr as *const u32) };
+        // let hart1_s_addr = self.plic.base() + 0x0020_0004 + 0x1000 * (1 * 2 + 1);
+        // let hart1_s_irq = unsafe { core::ptr::read_volatile(hart1_s_addr as *const u32) };
+
+        // debug!("HART0 {}:{}", hart0_m_irq, hart0_s_irq);
+        // debug!("HART1 {}:{}", hart1_m_irq, hart1_s_irq);
+
+        if irq == 0{
+            error!("handle_irq vcpu{} error", vcpu_id);
+            // assert!(vcpu_id != 0);
+            // assert!(vcpu_id != 1);
+            // panic!("wah???");
+        }
+        
         self.plic.claim_complete[context_id] = irq;
 
         CSR.hvip
