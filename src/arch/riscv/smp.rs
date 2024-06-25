@@ -123,6 +123,15 @@ impl<H: HyperCraftHal> PerCpu<H> {
         // Ok(BOOT_STACK as GuestPhysAddr)
         Ok(0 as GuestPhysAddr)
     }
+
+    // ADDED multi-bounding
+    /// fetch next vcpu id
+    pub fn next_vcpu(&mut self) -> usize {
+        let mut lock_guard = self.vcpu_queue.lock();
+        let next_id = lock_guard.pop_front().unwrap();
+        lock_guard.push_back(next_id);
+        next_id
+    }
 }
 
 // PerCpu state obvioudly cannot be shared between threads.

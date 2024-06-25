@@ -1,5 +1,6 @@
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 #[repr(C)]
+// MODIFIED
 pub struct GeneralPurposeRegisters([usize; 32]);
 
 /// Index of risc-v general purpose registers in `GeneralPurposeRegisters`.

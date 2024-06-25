@@ -1,4 +1,4 @@
-use core::panic;
+use core::{arch::asm, panic};
 
 use super::{
     devices::plic::{PlicState, MAX_CONTEXTS},
@@ -12,9 +12,14 @@ use super::{
 use crate::{
     arch::sbi::{HSMFunction, SBI_ERR_NOT_SUPPORTED}, vcpus::VM_CPUS_MAX, GprIndex, GuestPageTableTrait, GuestPhysAddr, GuestVirtAddr, HyperCraftHal, HyperError, HyperResult, VCpu, VmCpuStatus, VmCpus, VmExitInfo
 };
+use alloc::{collections::VecDeque, vec::Vec};
 use riscv::addr::BitField;
 use riscv_decode::Instruction;
 use sbi_rt::{pmu_counter_get_info, pmu_counter_stop, SbiRet};
+use spin::{mutex::Mutex};
+
+// ADDED multi-bounding
+const VCPU_NUM: usize = 2;
 
 /// A VM that is being run.
 pub struct VM<H: HyperCraftHal, G: GuestPageTableTrait> {
@@ -22,6 +27,18 @@ pub struct VM<H: HyperCraftHal, G: GuestPageTableTrait> {
     gpt: G,
     vm_pages: VmPages,
     plic: PlicState,
+
+    // ADDED multi-bounding
+    // TODO: num???
+    // regs: [Option<GeneralPurposeRegisters>; VCPU_NUM], 
+    // switched: [bool; VCPU_NUM],
+    // timer_pending: Mutex<VecDeque<isize>>,
+    // next_timer: Option<u64>,
+    // timer_vec: Mutex<VecDeque<u64>>,
+    // timer_vec: VecDeque<u64>,
+    timer_vec: Vec<VecDeque<u64>>,
+    ipi_flag: [bool; VCPU_NUM],
+
 }
 
 impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
@@ -32,6 +49,16 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
             gpt,
             vm_pages: VmPages::default(),
             plic: PlicState::new(0xC00_0000),
+
+            // ADDED multi-bounding
+            // regs: [None; VCPU_NUM],
+            // switched: [false; VCPU_NUM],
+            // timer_pending: Mutex::new(VecDeque::new()),
+            // next_timer: None,
+            // timer_vec: Mutex::new(VecDeque::new()),
+            // timer_vec: VecDeque::new(),
+            timer_vec: vec![VecDeque::new(); VCPU_NUM],
+            ipi_flag: [false; VCPU_NUM],
         })
     }
 
@@ -47,13 +74,33 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
     }
 
     /// Waiting sync
-    pub fn sync_vcpu(&mut self, vcpu_id: usize) {
+    // pub fn sync_vcpu(&mut self, vcpu_id: usize) {
+    //     let vcpu = self.vcpus.get_vcpu(vcpu_id).unwrap();
+    //     loop {
+    //         let state = vcpu.get_status();
+    //         match state {
+    //             VmCpuStatus::Runnable =>{
+    //                 debug!("VCPU{} ready to run!!!", vcpu_id);
+    //                 break;
+    //             }
+    //             VmCpuStatus::Running => {
+    //                 panic!("wtf??");
+    //             }
+    //             _ => {
+    //                 core::hint::spin_loop();
+    //             }
+    //         }
+    //     }
+    // }
+    pub fn sync_vcpu(&mut self, vcpu_id: usize) -> bool{
         let vcpu = self.vcpus.get_vcpu(vcpu_id).unwrap();
         loop {
             let state = vcpu.get_status();
             match state {
                 VmCpuStatus::Runnable =>{
-                    debug!("VCPU{} ready to run!!!", vcpu_id);
+                    if vcpu_id != 0 {
+                        debug!("VCPU{} ready to run!!!", vcpu_id);
+                    }
                     break;
                 }
                 VmCpuStatus::Running => {
@@ -61,22 +108,90 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                 }
                 _ => {
                     core::hint::spin_loop();
+                    // MODIFIED
+                    debug!("VCPU{} sync failed, yield", vcpu_id);
+                    return false;
                 }
             }
         }
+        true
     }
 
     #[allow(unused_variables, deprecated)]
     /// Run the host VM's vCPU with ID `vcpu_id`. Does not return.
     pub fn run(&mut self, vcpu_id: usize) {
         // ADDED
-        self.sync_vcpu(vcpu_id);
+        // self.sync_vcpu(vcpu_id);
+        if !self.sync_vcpu(vcpu_id) {
+            return;
+        }
 
         let mut vm_exit_info: VmExitInfo;
+
+        // MODIFIED
         let mut gprs = GeneralPurposeRegisters::default();
+        // let mut gprs = if let Some(res) = self.regs[vcpu_id] {
+        //     res
+        // }else{
+        //     GeneralPurposeRegisters::default()
+        // };
+        
+        // ADDED
+        // info!("eeeee");
+        // let mtime = unsafe { core::ptr::read_volatile(0x200_BFF8 as *const u32) };
+        // info!("bbbbbb");
+        // sbi_rt::set_timer((mtime + 50000) as u64);
+
+
+        // self.timer_pending.lock().clear();
+        // assert!(self.timer_pending.lock().is_empty());
+        fn read_time() -> u64 {
+            let mut time: u64;
+            unsafe {
+                asm!(
+                    "rdtime {time}",
+                    time = out(reg) time
+                );
+            }
+            time
+        }
+        // let now_time = read_time();
+        let target_time = read_time() + 50000;
+        // error!("now is {}", now_time);
+        // sbi_rt::set_timer(read_time() + 50000); //100000
+        sbi_rt::set_timer(target_time);
+        debug!("VCPU{} will exit after {}",vcpu_id, target_time);
+        // // self.timer_pending.lock().push_back(0);
+        CSR.sie
+            .read_and_set_bits(traps::interrupt::SUPERVISOR_TIMER);
+
+        // info!("VCPU{} host timer set!", vcpu_id);
+
+        if self.ipi_flag[vcpu_id] {
+            debug!("VCPU{} need ipi!", vcpu_id);
+            let sbi_ret = sbi_rt::send_ipi(0x1, 0x0);
+            self.ipi_flag[vcpu_id] = false;
+        }
+
+        
+
         loop {
             let mut len = 4;
             let mut advance_pc = false;
+
+            // let now = read_time();
+            // if let Some(next) = self.next_timer {
+            //     if now >= next {
+            //         // error!("VCPU{} next timer expired!", vcpu_id);
+            //         CSR.hvip
+            //             .read_and_set_bits(traps::interrupt::VIRTUAL_SUPERVISOR_TIMER);
+            //         self.next_timer = None;
+            //     }
+            // }
+
+            // assert!(self.timer_vec.lock().is_empty());
+            // assert!(self.timer_vec.is_empty());
+
             {
                 let vcpu = self.vcpus.get_vcpu(vcpu_id).unwrap();
                 // ADDED
@@ -86,6 +201,27 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                 vcpu.set_status(VmCpuStatus::Runnable);
                 vcpu.save_gprs(&mut gprs);
             }
+
+            // ADDED
+            let mut switch_flag = false;
+
+            fn read_tp() -> usize {
+                let tp: usize;
+                unsafe {
+                    // 使用内联汇编读取tp寄存器
+                    // 这里的`0`是临时寄存器，`tp`是目标寄存器
+                    asm!(
+                        "mv {}, tp", // 将tp寄存器的值移动到临时寄存器
+                        lateout(reg) tp, // 将临时寄存器的值输出到tp变量
+                        options(nostack, nomem, preserves_flags)
+                    );
+                }
+                tp
+            }
+            debug!("VCPU{} htp: {:#x}, vtp: {:#x}", vcpu_id, read_tp(), gprs.reg(GprIndex::TP));
+
+            error!("VCPU{} exit info: {:#?}", vcpu_id, vm_exit_info);
+            
 
             match vm_exit_info {
                 VmExitInfo::Ecall(sbi_msg) => {
@@ -106,6 +242,13 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                             }
                             HyperCallMsg::SetTimer(timer) => {
                                 sbi_rt::set_timer(timer as u64);
+                                error!("VCPU{} guest set {}", vcpu_id, timer);
+                                // assert!(*self.timer_vec.lock().back().unwrap() < timer as u64);
+                                // self.timer_vec.lock().push_back(timer as u64);
+                                if !self.timer_vec[vcpu_id].is_empty() {
+                                    assert!(*self.timer_vec[vcpu_id].back().unwrap() < timer as u64);
+                                }
+                                self.timer_vec[vcpu_id].push_back(timer as u64);
                                 // Clear guest timer interrupt
                                 CSR.hvip.read_and_clear_bits(
                                     traps::interrupt::VIRTUAL_SUPERVISOR_TIMER,
@@ -113,6 +256,21 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                                 //  Enable host timer interrupt
                                 CSR.sie
                                     .read_and_set_bits(traps::interrupt::SUPERVISOR_TIMER);
+
+                                // ADDED
+                                // let mut guard = self.timer_pending.lock();
+                                // guard.push_back(1);
+
+                                // CSR.hvip.read_and_clear_bits(
+                                //     traps::interrupt::VIRTUAL_SUPERVISOR_TIMER,
+                                // );
+                                // // assert_matches!(self.next_timer, None);
+                                // assert!(self.next_timer == None);
+                                // self.next_timer = Some(timer as u64);
+                                
+                                // debug!("VCPU{} set timer & switch", vcpu_id);
+                                // switch_flag = true;
+                                
                             }
                             HyperCallMsg::Reset(_) => {
                                 sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::SystemFailure);
@@ -129,8 +287,9 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                                 self.handle_hsm_function(hsm, &mut gprs).unwrap();
                             }
                             HyperCallMsg::SPI(spi) => {
-                                trace!("vcpu{} SPI calling !", vcpu_id);
+                                debug!("vcpu{} SPI calling !", vcpu_id);
                                 self.handle_spi_function(spi, &mut gprs).unwrap();
+                                switch_flag = true;
                             }
                             _ => todo!(),
                         }
@@ -144,7 +303,9 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                     falut_pc,
                     inst,
                     priv_level,
-                } => match priv_level {
+                } => {
+                    // info!("VCPU{} page fault ({:#x}, {:#x}, {:#x}, {:#?})", vcpu_id, fault_addr, falut_pc, inst, priv_level);
+                    match priv_level {
                     super::vmexit::PrivilegeLevel::Supervisor => {
                         match self.handle_page_fault(falut_pc, inst, fault_addr, &mut gprs) {
                             Ok(inst_len) => {
@@ -162,22 +323,98 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                     super::vmexit::PrivilegeLevel::User => {
                         panic!("User page fault")
                     }
-                },
+                }},
                 VmExitInfo::TimerInterruptEmulation => {
                     // debug!("timer irq emulation");
                     // Enable guest timer interrupt
-                    CSR.hvip
-                        .read_and_set_bits(traps::interrupt::VIRTUAL_SUPERVISOR_TIMER);
+                    // MODIFIED
+                    // CSR.hvip
+                    //     .read_and_set_bits(traps::interrupt::VIRTUAL_SUPERVISOR_TIMER);
+
                     // Clear host timer interrupt
                     CSR.sie
                         .read_and_clear_bits(traps::interrupt::SUPERVISOR_TIMER);
+
+                    let now = read_time();
+                    
+                    if !self.timer_vec[vcpu_id].is_empty() {
+                        assert!(now >= *self.timer_vec[vcpu_id].front().unwrap());
+                    }
+
+                    let tmp = self.timer_vec[vcpu_id].pop_front();
+
+                    if !self.timer_vec[vcpu_id].is_empty() {
+                        assert!(now < *self.timer_vec[vcpu_id].front().unwrap());
+                    }
+
+                    if now <= target_time {
+                        debug!("VCPU{} guest timer {} expired when now is {}!", vcpu_id, tmp.unwrap(), now);
+                        CSR.hvip
+                            .read_and_set_bits(traps::interrupt::VIRTUAL_SUPERVISOR_TIMER);
+                        sbi_rt::set_timer(target_time);
+                        // // self.timer_pending.lock().push_back(0);
+                        CSR.sie
+                            .read_and_set_bits(traps::interrupt::SUPERVISOR_TIMER);
+                    }else{
+                        debug!("VCPU{} host timer expired when now is {}!", vcpu_id, now);
+                        switch_flag = true;
+                    }
+
+
+
+                    // if read_time() >= target_time {
+                    //     // error!("VCPU{} next timer expired!", vcpu_id);
+                    //     switch_flag = true;
+                    // }else {
+                    //     CSR.hvip
+                    //     .read_and_set_bits(traps::interrupt::VIRTUAL_SUPERVISOR_TIMER);
+                    // }
+
+                    
+                    // // ADDED switch
+                    // let mut guard = self.timer_pending.lock();
+                    // assert!(guard.len() <= 2, "deque size:{} with {:#?}", guard.len(), guard);
+                    // let res = guard.pop_front().unwrap();
+
+                    // assert!((res == 0) || (res == 1));
+
+                    // if res == 1 {
+                    //     debug!("VCPU{} get guest timer int, countinue", vcpu_id);
+                    //     CSR.hvip
+                    //         .read_and_set_bits(traps::interrupt::VIRTUAL_SUPERVISOR_TIMER);
+                    //     if guard.is_empty() {
+                    //         // Clear host timer interrupt
+                    //         CSR.sie
+                    //             .read_and_clear_bits(traps::interrupt::SUPERVISOR_TIMER);
+                    //     }
+                    // }else{
+                    //     debug!("VCPU{} get host timer int, go to switch", vcpu_id);
+                    //     switch_flag = true;
+                    //     // Clear host timer interrupt
+                    //     CSR.sie
+                    //         .read_and_clear_bits(traps::interrupt::SUPERVISOR_TIMER);
+                    // }
+                    
+                    // debug!("VCPU{} set switch flag", vcpu_id);
+
+
+                    // let now = read_time();
+                    // let next = self.next_timer.unwrap();
+                    // if now >= next {
+                    //     error!("VCPU{} next timer expired!", vcpu_id);
+                    //     CSR.hvip
+                    //         .read_and_set_bits(traps::interrupt::VIRTUAL_SUPERVISOR_TIMER);
+                    //     self.next_timer = None;
+                    // }
+                    // switch_flag = true;
+
                 }
                 VmExitInfo::ExternalInterruptEmulation => self.handle_irq(vcpu_id),
                 // ADDED
                 VmExitInfo::SoftInterruptEmulation => {
                     // TODO
                     // 这块内容河里吗
-                    // debug!("VCPU{} software emulation", vcpu_id);
+                    error!("VCPU{} software emulation", vcpu_id);
                     let mut sip = riscv::register::sip::read().bits();
                     // debug!("SIP: {:#x}", sip);
                     let res = sip.set_bit(1, false);
@@ -197,6 +434,20 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                 vcpu.restore_gprs(&gprs);
                 if advance_pc {
                     vcpu.advance_pc(len);
+                }
+
+                // assert!(self.ipi_flag[vcpu_id] == false);
+                // assert!(self.timer_vec[vcpu_id].is_empty());
+
+                // MODIFIED
+                if switch_flag {
+                    // self.regs[vcpu_id] = Some(gprs);
+                    // error!("VCPU{} switch!!!", vcpu_id);
+                    // self.switched[vcpu_id] = true;
+                    // Clear host timer interrupt
+                    CSR.sie
+                        .read_and_clear_bits(traps::interrupt::SUPERVISOR_TIMER);
+                    return;
                 }
             }
         }
@@ -258,14 +509,17 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
     }
 
     fn handle_irq(&mut self, vcpu_id: usize) {
+        error!("VPU{} handle irq", vcpu_id);
         let context_id = vcpu_id * 2 + 1;
         let claim_and_complete_addr = self.plic.base() + 0x0020_0004 + 0x1000 * context_id;
         let irq = unsafe { core::ptr::read_volatile(claim_and_complete_addr as *const u32) };
         // TODO ang?
         // assert!(irq != 0);
-        let reg_mmode_addr = self.plic.base() + 0x0020_0004 + 0x1000 * (vcpu_id * 2);
-        let m_irq = unsafe { core::ptr::read_volatile(reg_mmode_addr as *const u32) };
-        debug!("handle_irq {}:{} in vcpu{}@{:#x}", m_irq, irq, vcpu_id, claim_and_complete_addr);
+
+        // let reg_mmode_addr = self.plic.base() + 0x0020_0004 + 0x1000 * (vcpu_id * 2);
+        // let m_irq = unsafe { core::ptr::read_volatile(reg_mmode_addr as *const u32) };
+        // debug!("handle_irq {}:{} in vcpu{}@{:#x}", m_irq, irq, vcpu_id, claim_and_complete_addr);
+
         // let irq2 = unsafe { core::ptr::read_volatile(claim_and_complete_addr as *const u32) };
         // debug!("double run : {}", irq2);
         
@@ -283,7 +537,7 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
         // debug!("HART1 {}:{}", hart1_m_irq, hart1_s_irq);
 
         if irq == 0{
-            error!("handle_irq vcpu{} error", vcpu_id);
+            error!("handle_irq vcpu{} error?", vcpu_id);
             // assert!(vcpu_id != 0);
             // assert!(vcpu_id != 1);
             // panic!("wah???");
@@ -379,6 +633,7 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                 hart_mask,
                 hart_mask_base,
             } => {
+                assert!(hart_mask_base == 0);
                 let sbi_ret = sbi_rt::remote_fence_i(hart_mask as usize, hart_mask_base as usize);
                 gprs.set_reg(GprIndex::A0, sbi_ret.error);
                 gprs.set_reg(GprIndex::A1, sbi_ret.value);
@@ -389,6 +644,7 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                 start_addr,
                 size,
             } => {
+                assert!(hart_mask_base == 0);
                 let sbi_ret = sbi_rt::remote_sfence_vma(
                     hart_mask as usize,
                     hart_mask_base as usize,
@@ -406,6 +662,7 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                 size, 
                 asid 
             } => {
+                assert!(hart_mask_base == 0);
                 let sbi_ret = sbi_rt::remote_sfence_vma_asid(
                     hart_mask as usize,
                     hart_mask_base as usize,
@@ -442,6 +699,8 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                 vcpu.set_gpr(GprIndex::A0, hartid);
                 vcpu.set_gpr(GprIndex::A1, opaque);
                 vcpu.set_spec(start_addr);
+
+                // vcpu.set_gpr(GprIndex::TP, 0xffffffd8016aad00);
 
                 vcpu.set_status(VmCpuStatus::Runnable);
                 debug!("---guest hsm start set runnable {}", hartid);
@@ -483,10 +742,17 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                 hart_mask,
                 hart_mask_base, 
             } => {
-                trace!("---guest send ipi:({:#x}, {:#x})", hart_mask, hart_mask_base);
+                debug!("---guest send ipi:({:#x}, {:#x})", hart_mask, hart_mask_base);
 
-                let sbi_ret = sbi_rt::send_ipi(hart_mask, hart_mask_base);
+                // let sbi_ret = sbi_rt::send_ipi(hart_mask, hart_mask_base);
 
+                // gprs.set_reg(GprIndex::A0, sbi_ret.error);
+                // gprs.set_reg(GprIndex::A1, sbi_ret.value);
+
+                // assert!(self.ipi_flag[hart_mask_base] == false);
+                self.ipi_flag[hart_mask_base] = true;
+
+                let sbi_ret = SbiRet::success(0);
                 gprs.set_reg(GprIndex::A0, sbi_ret.error);
                 gprs.set_reg(GprIndex::A1, sbi_ret.value);
             }
