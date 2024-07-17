@@ -38,7 +38,8 @@ pub struct VM<H: HyperCraftHal, G: GuestPageTableTrait> {
     // timer_vec: VecDeque<u64>,
     timer_vec: Vec<VecDeque<u64>>,
     ipi_flag: [bool; VCPU_NUM],
-
+    external_flag: [bool; VCPU_NUM],
+    hvip_bak: [Option<u64>; VCPU_NUM],
 }
 
 impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
@@ -59,6 +60,8 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
             // timer_vec: VecDeque::new(),
             timer_vec: vec![VecDeque::new(); VCPU_NUM],
             ipi_flag: [false; VCPU_NUM],
+            external_flag: [false; VCPU_NUM],
+            hvip_bak: [None; VCPU_NUM],
         })
     }
 
@@ -173,6 +176,17 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
             self.ipi_flag[vcpu_id] = false;
         }
 
+        if self.external_flag[vcpu_id] {
+            assert!(vcpu_id == 0);
+            debug!("VCPU{} need external!", vcpu_id);
+            self.handle_irq(vcpu_id);
+            self.external_flag[vcpu_id] = false;
+        }
+
+        if let Some(val) = self.hvip_bak[vcpu_id] {
+            CSR.hvip.write_value(val as usize);
+        }
+
         
 
         loop {
@@ -205,20 +219,20 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
             // ADDED
             let mut switch_flag = false;
 
-            fn read_tp() -> usize {
-                let tp: usize;
-                unsafe {
-                    // 使用内联汇编读取tp寄存器
-                    // 这里的`0`是临时寄存器，`tp`是目标寄存器
-                    asm!(
-                        "mv {}, tp", // 将tp寄存器的值移动到临时寄存器
-                        lateout(reg) tp, // 将临时寄存器的值输出到tp变量
-                        options(nostack, nomem, preserves_flags)
-                    );
-                }
-                tp
-            }
-            debug!("VCPU{} htp: {:#x}, vtp: {:#x}", vcpu_id, read_tp(), gprs.reg(GprIndex::TP));
+            // fn read_tp() -> usize {
+            //     let tp: usize;
+            //     unsafe {
+            //         // 使用内联汇编读取tp寄存器
+            //         // 这里的`0`是临时寄存器，`tp`是目标寄存器
+            //         asm!(
+            //             "mv {}, tp", // 将tp寄存器的值移动到临时寄存器
+            //             lateout(reg) tp, // 将临时寄存器的值输出到tp变量
+            //             options(nostack, nomem, preserves_flags)
+            //         );
+            //     }
+            //     tp
+            // }
+            // debug!("VCPU{} htp: {:#x}, vtp: {:#x}", vcpu_id, read_tp(), gprs.reg(GprIndex::TP));
 
             error!("VCPU{} exit info: {:#?}", vcpu_id, vm_exit_info);
             
@@ -245,6 +259,7 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                                 error!("VCPU{} guest set {}", vcpu_id, timer);
                                 // assert!(*self.timer_vec.lock().back().unwrap() < timer as u64);
                                 // self.timer_vec.lock().push_back(timer as u64);
+                                assert!(self.timer_vec[vcpu_id].len() <= 1);
                                 if !self.timer_vec[vcpu_id].is_empty() {
                                     assert!(*self.timer_vec[vcpu_id].back().unwrap() < timer as u64);
                                 }
@@ -276,6 +291,7 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                                 sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::SystemFailure);
                             }
                             HyperCallMsg::RemoteFence(rfnc) => {
+                                assert!(vcpu_id == 0);
                                 self.handle_rfnc_function(rfnc, &mut gprs).unwrap();
                             }
                             HyperCallMsg::PMU(pmu) => {
@@ -409,22 +425,36 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                     // switch_flag = true;
 
                 }
-                VmExitInfo::ExternalInterruptEmulation => self.handle_irq(vcpu_id),
+                VmExitInfo::ExternalInterruptEmulation => {
+                    if vcpu_id == 0 {
+                        self.handle_irq(vcpu_id);
+                    }
+                    else {
+                        self.external_flag[0] = true;
+                        // switch_flag = true;
+                    }
+                }
                 // ADDED
                 VmExitInfo::SoftInterruptEmulation => {
                     // TODO
                     // 这块内容河里吗
                     error!("VCPU{} software emulation", vcpu_id);
-                    let mut sip = riscv::register::sip::read().bits();
-                    // debug!("SIP: {:#x}", sip);
-                    let res = sip.set_bit(1, false);
-                    // debug!("Modified SIP {:#x}", res);
-                    riscv::register::sip::write(*res);
+                    // let mut sip = riscv::register::sip::read().bits();
+                    // // debug!("SIP: {:#x}", sip);
+                    // let res = sip.set_bit(1, false);
+                    // // debug!("Modified SIP {:#x}", res);
+                    // riscv::register::sip::write(*res);
+
                     // riscv::register::satp::write(res);
                     // core::arch::asm!("csrrs {0}, {1}, x0", out(reg) r, const $csr_number);
-                    // sbi_rt::legacy::clear_ipi();
+                    // CSR.sie
+                    //     .read_and_clear_bits(traps::interrupt::SUPERVISOR_TIMER);
+                    sbi_rt::legacy::clear_ipi();
                     CSR.hvip
                         .read_and_set_bits(traps::interrupt::VIRTUAL_SUPERVISOR_SOFT);
+                    // advance_pc = true;
+                    // CSR.sie
+                    //     .read_and_set_bits(traps::interrupt::SUPERVISOR_TIMER);
                 }
                 _ => {}
             }
@@ -438,6 +468,7 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
 
                 // assert!(self.ipi_flag[vcpu_id] == false);
                 // assert!(self.timer_vec[vcpu_id].is_empty());
+                assert!(self.timer_vec[vcpu_id].len() <= 1);
 
                 // MODIFIED
                 if switch_flag {
@@ -447,6 +478,10 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                     // Clear host timer interrupt
                     CSR.sie
                         .read_and_clear_bits(traps::interrupt::SUPERVISOR_TIMER);
+
+                    let val = CSR.hvip.get_value();
+                    self.hvip_bak[vcpu_id] = Some(val as u64);
+
                     return;
                 }
             }
@@ -510,6 +545,8 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
 
     fn handle_irq(&mut self, vcpu_id: usize) {
         error!("VPU{} handle irq", vcpu_id);
+        assert!(vcpu_id == 0);
+        // assert!(self.external_flag[vcpu_id] == false);
         let context_id = vcpu_id * 2 + 1;
         let claim_and_complete_addr = self.plic.base() + 0x0020_0004 + 0x1000 * context_id;
         let irq = unsafe { core::ptr::read_volatile(claim_and_complete_addr as *const u32) };
