@@ -10,7 +10,7 @@ use memoffset::offset_of;
 use tock_registers::LocalRegisterCopy;
 
 // use alloc::sync::Arc;
-use riscv::register::{htinst, htval, hvip, scause, sstatus, stval};
+use riscv::register::{htinst, htval, hvip, scause, sstatus, stval, sie};
 
 use crate::arch::vmexit::PrivilegeLevel;
 use crate::arch::{traps, RiscvCsrTrait, CSR};
@@ -33,6 +33,9 @@ struct HypervisorCpuState {
     scounteren: usize,
     stvec: usize,
     sscratch: usize,
+
+    // ADDED
+    // sie: usize,
 }
 
 /// Guest GPR and CSR state which must be saved/restored when exiting/entering virtualization.
@@ -163,6 +166,9 @@ global_asm!(
     hyp_scounteren = const hyp_csr_offset!(scounteren),
     hyp_stvec = const hyp_csr_offset!(stvec),
     hyp_sscratch = const hyp_csr_offset!(sscratch),
+    // ADDED
+    // hyp_sie = const hyp_csr_offset!(sie),
+
     guest_ra = const guest_gpr_offset(GprIndex::RA),
     guest_gp = const guest_gpr_offset(GprIndex::GP),
     guest_tp = const guest_gpr_offset(GprIndex::TP),
@@ -316,10 +322,20 @@ impl<H: HyperCraftHal> VCpu<H> {
         // drop(tmp);
 
         unsafe {
+            sstatus::clear_sie();
+            sie::set_sext();
+            sie::set_ssoft();
+            sie::set_stimer();
+        }
+
+        debug!("before run");
+        unsafe {
             // Safe to run the guest as it only touches memory assigned to it by being owned
             // by its page table
             _run_guest(regs);
         }
+        debug!("after run");
+
         // ADDED
         self.status = VmCpuStatus::Runnable;
         // let mut tmp = self.status.lock();
@@ -333,6 +349,16 @@ impl<H: HyperCraftHal> VCpu<H> {
 
         let scause = scause::read();
         use scause::{Exception, Interrupt, Trap};
+
+        info!("vcpu info: {:#?}", scause.cause());
+
+        unsafe {
+            sie::clear_sext();
+            sie::clear_ssoft();
+            sie::clear_stimer();
+            sstatus::set_sie();
+        }
+
         match scause.cause() {
             Trap::Exception(Exception::VirtualSupervisorEnvCall) => {
                 let sbi_msg = SbiMessage::from_regs(regs.guest_regs.gprs.a_regs()).ok();

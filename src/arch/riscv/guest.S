@@ -2,6 +2,16 @@
 /// Enter the guest given in `VmCpuRegisters` from `a0`
 .global _run_guest
 _run_guest:
+
+//    addi sp, sp, -4         # 为保存 sie 寄存器的值分配栈空间
+//    csrr t1, sie            # 将 sie 寄存器的值读取到 t0
+//    sw t1, 0(sp)            # 将 t0 的值保存到栈上
+//    csrw sie, x0            # 将 x0 (即 0) 的值写入 sie 寄存器
+
+//    csrr t1, sie  // 读sie->t1
+//    sd   t1, (hyp_sie)(a0) // 存t1->hyp_sie
+//    csrw sie, x0 // 写0->sie
+
     /* Save hypervisor state */
 
     /* Save hypervisor GPRs (except T0-T6 and a0, which is GuestInfo and stashed in sscratch) */
@@ -54,6 +64,9 @@ _run_guest:
     csrrw t1, sscratch, a0
     sd    t1, ({hyp_sscratch})(a0)
 
+#    ld   t1, (hyp_sie)(a0) // 取hyp_sie->t1
+#    csrw sscratch, t1 // 写t1->sscratch
+
     /* Restore the gprs from this GuestInfo */
     ld   ra, ({guest_ra})(a0)
     ld   gp, ({guest_gp})(a0)
@@ -84,13 +97,27 @@ _run_guest:
     ld   t4, ({guest_t4})(a0)
     ld   t5, ({guest_t5})(a0)
     ld   t6, ({guest_t6})(a0)
+
+    # 恢复 sie 寄存器的值
+//    lw t0, 0(sp)            # 从栈上加载 sie 的原始值到 t0
+//    csrw sie, t0            # 将 t0 的值写回 sie 寄存器
+//    addi sp, sp, 4          # 释放栈空间
+
     ld   sp, ({guest_sp})(a0)
+
+// 让t1复制a0,然后ld   t1, ({guest_t1})(t1)
+//    csrr  t1, ({guest_a0})(a0) // sscratch = a0, t1 = hyp_sie
+
+
     ld   a0, ({guest_a0})(a0)
 
     sret
 
 .align 2
 _guest_exit:
+
+//    csrw sie, x0
+
     /* Pull GuestInfo out of sscratch, swapping with guest's a0 */
     csrrw a0, sscratch, a0
 

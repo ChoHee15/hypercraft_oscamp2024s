@@ -1,4 +1,4 @@
-use core::panic;
+use core::{f32::consts::E, panic};
 
 use super::{
     devices::plic::{PlicState, MAX_CONTEXTS},
@@ -15,6 +15,10 @@ use crate::{
 use riscv::addr::BitField;
 use riscv_decode::Instruction;
 use sbi_rt::{pmu_counter_get_info, pmu_counter_stop, SbiRet};
+use tock_registers::interfaces::Writeable;
+
+use crate::timer::OS_TIMER;
+use riscv::register::time;
 
 /// A VM that is being run.
 pub struct VM<H: HyperCraftHal, G: GuestPageTableTrait> {
@@ -22,6 +26,11 @@ pub struct VM<H: HyperCraftHal, G: GuestPageTableTrait> {
     gpt: G,
     vm_pages: VmPages,
     plic: PlicState,
+
+    
+    // ADDED
+    guest_timer: Option<u64>,
+    
 }
 
 impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
@@ -32,6 +41,8 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
             gpt,
             vm_pages: VmPages::default(),
             plic: PlicState::new(0xC00_0000),
+            //ADDED
+            guest_timer: None,
         })
     }
 
@@ -75,6 +86,51 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
         let mut vm_exit_info: VmExitInfo;
         let mut gprs = GeneralPurposeRegisters::default();
         loop {
+
+            let now = time::read64();
+            let guard = OS_TIMER.lock();
+            let mut os_timer = *guard;
+            drop(guard);
+
+            error!("ostimer {}  vs  now {}", os_timer, now);
+
+
+            if now > os_timer {
+                // panic!("no way");
+                // error!("emmmm")
+                error!("active trap to arceos to update os timer!!!");
+                sbi_rt::set_timer(0);
+                CSR.sie
+                    .read_and_set_bits(traps::interrupt::SUPERVISOR_TIMER);
+                CSR.sie
+                    .read_and_clear_bits(traps::interrupt::SUPERVISOR_TIMER);
+                os_timer = *OS_TIMER.lock();
+            }
+
+            sbi_rt::set_timer(os_timer);
+
+            if let Some(guest_timer) = self.guest_timer {
+                if now >= guest_timer{
+                    CSR.hvip
+                        .read_and_set_bits(traps::interrupt::VIRTUAL_SUPERVISOR_TIMER);
+                }
+
+                if guest_timer < os_timer {
+                    sbi_rt::set_timer(guest_timer);
+                    self.guest_timer = None;
+                    debug!("clear & set guest timer {}!", guest_timer);
+                }else {
+                    debug!("set os timer {}!", os_timer);
+                }
+            }else {
+                debug!("no guest timer, so set os timer {}", os_timer);
+            }
+
+            // CSR.sie
+            //     .read_and_set_bits(traps::interrupt::SUPERVISOR_TIMER);
+
+
+
             let mut len = 4;
             let mut advance_pc = false;
             {
@@ -86,6 +142,8 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                 vcpu.set_status(VmCpuStatus::Runnable);
                 vcpu.save_gprs(&mut gprs);
             }
+
+            info!("vm info: {:#?}", vm_exit_info);
 
             match vm_exit_info {
                 VmExitInfo::Ecall(sbi_msg) => {
@@ -105,14 +163,18 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                                 sbi_rt::legacy::console_putchar(c);
                             }
                             HyperCallMsg::SetTimer(timer) => {
-                                sbi_rt::set_timer(timer as u64);
-                                // Clear guest timer interrupt
-                                CSR.hvip.read_and_clear_bits(
-                                    traps::interrupt::VIRTUAL_SUPERVISOR_TIMER,
-                                );
-                                //  Enable host timer interrupt
-                                CSR.sie
-                                    .read_and_set_bits(traps::interrupt::SUPERVISOR_TIMER);
+                                assert!(matches!(self.guest_timer, None));
+                                self.guest_timer = Some(timer as u64);
+                                debug!("Guest set a timer {}", timer);
+
+                                // sbi_rt::set_timer(timer as u64);
+                                // // Clear guest timer interrupt
+                                // CSR.hvip.read_and_clear_bits(
+                                //     traps::interrupt::VIRTUAL_SUPERVISOR_TIMER,
+                                // );
+                                // //  Enable host timer interrupt
+                                // CSR.sie
+                                //     .read_and_set_bits(traps::interrupt::SUPERVISOR_TIMER);
                             }
                             HyperCallMsg::Reset(_) => {
                                 sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::SystemFailure);
@@ -164,13 +226,28 @@ impl<H: HyperCraftHal, G: GuestPageTableTrait> VM<H, G> {
                     }
                 },
                 VmExitInfo::TimerInterruptEmulation => {
-                    // debug!("timer irq emulation");
-                    // Enable guest timer interrupt
-                    CSR.hvip
-                        .read_and_set_bits(traps::interrupt::VIRTUAL_SUPERVISOR_TIMER);
-                    // Clear host timer interrupt
-                    CSR.sie
-                        .read_and_clear_bits(traps::interrupt::SUPERVISOR_TIMER);
+                    error!("int!");
+                    // let os_g = OS_TIMER.lock();
+                    // let os_t = *os_g;
+                    // drop(os_g);
+                    // let now = time::read64() * 1000;
+                    // error!("ostimer {}  vs  now {}", os_t, now);
+                    // if os_t <=  now{
+                    //     error!("active trap to arceos to update os timer!!!");
+                    //     sbi_rt::set_timer(0);
+                    //     CSR.sie
+                    //         .read_and_set_bits(traps::interrupt::SUPERVISOR_TIMER);
+                    //     CSR.sie
+                    //         .read_and_clear_bits(traps::interrupt::SUPERVISOR_TIMER);
+                    // }
+
+                    // // debug!("timer irq emulation");
+                    // // Enable guest timer interrupt
+                    // CSR.hvip
+                    //     .read_and_set_bits(traps::interrupt::VIRTUAL_SUPERVISOR_TIMER);
+                    // // Clear host timer interrupt
+                    // CSR.sie
+                    //     .read_and_clear_bits(traps::interrupt::SUPERVISOR_TIMER);
                 }
                 VmExitInfo::ExternalInterruptEmulation => self.handle_irq(vcpu_id),
                 // ADDED

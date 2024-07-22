@@ -91,3 +91,6 @@ pub enum HyperError {
     /// Disabled.
     Disabled,
 }
+
+mod timer;
+pub use timer::{OS_TIMER, update_os_timer};
